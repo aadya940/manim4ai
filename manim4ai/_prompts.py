@@ -6,6 +6,9 @@ EXAMPLE_CODE = textwrap.dedent(
     from manim4ai import LayoutManager  # Use your actual module name here
     import numpy as np
 
+    def transformation_circle(m):
+        return m.move_to(LEFT * 3).rotate(PI)
+
     class DummyScene(Scene):
         def construct(self): 
             pass
@@ -27,7 +30,7 @@ EXAMPLE_CODE = textwrap.dedent(
 
     layout.place(scene, circle, {
         "animation_order": 0,
-        "animation_function": lambda m: m.move_to(LEFT * 3).rotate(PI),
+        "animation_function": transformation_circle,
         "id": "circle",
         "collision_group": "g2",
         "duration": 2
@@ -48,16 +51,28 @@ LIBRARIES = "- manim\n- manim4ai\n- numpy"
 GUIDELINES = textwrap.dedent(
     """\
     Guidelines:
-        - The animations should be intuitive and easy to understand.
-        - It should be no longer than 2 minutes.
-        - Make sure the objects are correctly placed and animated in the animation.
-        - Only return the python code, nothing else strictly.
+    - Do not modify the `construct` method; it must remain empty.
+    - Always use the `place` method of `LayoutManager` to animate objects.
+    - `animation_function` defined with `def` or `lambda` must accept a single `Mobject` as its input.
+    - `animation_function` can also be a `manim.Animation` object like `FadeOut`.
+    - Pass `animation_function` as a parameter without calling it.
+    - Do not define custom functions or use variables outside those shown in the example.
+    - Animations should be visual, comprehensive, information dense and intuitive.
+    - No object should collide with others unless they share a `collision_group`.
+      For example, if you are simulating objects on a NumberPlane, the NumberPlane 
+      should have the same `collision_group` as the other two objects etc.
+    - All objects must remain fully visible within the screen bounds.
+    - Use up to 3 objects in a per animation order.
+    - Avoid redundant imports or statements.
+    - Aim for longer videos.
+    - Objects with different `animation_order` can't be on the same screen.
+    - Objects should be added only through the `place` method of the `LayoutManager`.
 """
 )
 
 LAYOUT_DOC = textwrap.dedent(
     """\
-    Here are some important functions of the layout manager class:
+    Here are the methods of the layout manager class you can use:
     
     - LayoutManager.place:
         Place an object in the scene with its animation configuration.
@@ -71,10 +86,7 @@ LAYOUT_DOC = textwrap.dedent(
                 - collision_group (optional): Group ID for collision exemption
                 - id (optional): Unique identifier for the object
                 - duration (optional): Animation duration in seconds
-    
-    - LayoutManager.static_check:
-        Performs static checks on all placed objects and returns a string report.
-    
+        
     - LayoutManager.__init__:
         Initialize a new LayoutManager.
         Args:
@@ -111,4 +123,25 @@ def system_prompt(topic: str) -> str:
 def build_prompt(issues: str) -> str:
     if not isinstance(issues, str):
         raise ValueError("Issues must be a string.")
-    return f"Please regenerate the code.\n Only return the code.\n Your generated code has the following issues:\n\n{issues.strip()}"
+
+    return textwrap.dedent(
+        f"""\
+        The code you generated contains errors.
+
+        Possible issues include:
+        - Syntax errors (e.g., incorrect method calls or object definitions)
+        - Objects moving outside the visible scene area
+        - Objects unintentionally colliding or overlapping
+        - Violating the animation or layout constraints
+
+        You can resolve these issues by checking the syntatic mistakes,
+        changing the sizes of the objects, changing the paths slightly to avoid conflicts.
+
+        Please regenerate the code, fixing the specific problems below:
+
+        {issues.strip()}
+
+        Return only the corrected Python code.
+        Do not include comments, explanations, or any other text.
+    """
+    )

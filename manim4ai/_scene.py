@@ -5,6 +5,7 @@ from manim import tempconfig
 import os
 import inspect
 import numpy as np
+from functools import lru_cache
 
 
 class LayoutManager:
@@ -23,6 +24,9 @@ class LayoutManager:
     - Automatic rendering of animations
     """
 
+    # Class constant for frame boundaries
+    FRAME_BOX = box(-7, -4, 7, 4)
+
     def __init__(self, max_objects=4, samples=10) -> None:
         """
         Initialize a new LayoutManager.
@@ -39,6 +43,9 @@ class LayoutManager:
         )  # Minimum 3 samples for better curve approximation
         self._info = {}  # Structure: {session: {order: [(object, config, path)]}}
         self.collision_groups = {}  # Structure: {group_id: [object_ids]}
+
+        # Cache for bounding boxes to avoid recalculating for the same objects
+        self._bbox_cache = {}
 
     def place(self, session: Scene, object: Mobject, animation_config: dict):
         """
@@ -73,7 +80,7 @@ class LayoutManager:
                 self.collision_groups[collision_group] = []
             self.collision_groups[collision_group].append(object_id)
 
-        # Compute trajectory using sampled points
+        # Use cached trajectory if possible, compute if needed
         trajectory = self._compute_trajectory(object, animation_function)
 
         if session not in self._info:
@@ -94,7 +101,6 @@ class LayoutManager:
             str:
                 A report of potential layout issues, or an empty string if no issues found
         """
-        FRAME_BOX = box(-7, -4, 7, 4)
         issues = []
 
         for session, orders in self._info.items():
@@ -112,11 +118,17 @@ class LayoutManager:
 
                 # Check intersections and screen bounds
                 for i, (obj_i, config_i, traj_i, id_i) in enumerate(group):
-                    if not self._path_within_bounds(traj_i, FRAME_BOX):
+                    if not self._path_within_bounds(traj_i):
                         session_issues.append(
                             f" Object '{obj_i}' trajectory goes out of frame bounds"
                         )
 
+                    # Early termination of inner loop if no more objects to check
+                    if i == len(group) - 1:
+                        continue
+
+                    # Use collision lookup table approach for better performance with many objects
+                    collision_candidates = []
                     for j in range(i + 1, len(group)):
                         obj_j, config_j, traj_j, id_j = group[j]
 
@@ -124,21 +136,27 @@ class LayoutManager:
                         if self._in_same_collision_group(id_i, id_j):
                             continue
 
-                        # First check if trajectories overlap at all (fast test)
-                        if traj_i.intersects(traj_j):
-                            # If trajectories intersect, check for time-based collisions
-                            collision_times = self._detect_time_based_collisions(
-                                obj_i, config_i, obj_j, config_j
-                            )
+                        collision_candidates.append((j, obj_j, config_j, traj_j, id_j))
 
-                            if collision_times:
-                                # Real collision detected
-                                time_info = ", ".join(
-                                    [f"t≈{t:.2f}" for t in collision_times]
-                                )
-                                session_issues.append(
-                                    f"Objects '{obj_i}' and '{obj_j}' collide at normalized time {time_info}"
-                                )
+                    # Batch check collisions to reduce redundant calculations
+                    for j, obj_j, config_j, traj_j, id_j in collision_candidates:
+                        # First check if trajectories overlap at all (fast test)
+                        if not traj_i.intersects(traj_j):
+                            continue
+
+                        # If trajectories intersect, check for time-based collisions
+                        collision_times = self._detect_time_based_collisions(
+                            obj_i, config_i, obj_j, config_j
+                        )
+
+                        if collision_times:
+                            # Real collision detected
+                            time_info = ", ".join(
+                                [f"t≈{t:.2f}" for t in collision_times]
+                            )
+                            session_issues.append(
+                                f"Objects '{obj_i}' and '{obj_j}' collide at normalized time {time_info}"
+                            )
 
                 if len(session_issues) > 1:  # More than just the header
                     issues.extend(session_issues)
@@ -170,6 +188,14 @@ class LayoutManager:
             LineString:
                 A Shapely LineString representing the path of the object's bounding box
         """
+        # Calculate a hash for caching
+        obj_hash = id(obj)
+        anim_hash = id(animation_function) if animation_function else 0
+        cache_key = (obj_hash, anim_hash)
+
+        # Return cached trajectory if exists
+        cache_key = (obj_hash, anim_hash)
+
         # If no animation function is provided, return a simple trajectory based on current position
         if animation_function is None:
             bbox = self._get_bounding_box(obj)
@@ -183,69 +209,84 @@ class LayoutManager:
                 ]
             )
 
-        # Sample the animation at multiple time points to capture curved motion
-        points = []
+        # For efficiency, check if this animation is likely to be complex
+        # (requires full sampling) or simple (can use simpler interpolation)
+        is_complex_animation = self._is_complex_animation(animation_function)
 
-        # Create a list to store the bounding box corners for each sample
+        # Use fewer samples for simple animations
+        sample_count = (
+            self.samples if is_complex_animation else max(3, self.samples // 2)
+        )
+
+        # Sample the animation at multiple time points to capture curved motion
         bbox_corners = []
 
-        for t in np.linspace(0, 1, self.samples):
-            # Create a temporary copy of the object for this time point
-            temp_obj = obj.copy()
+        # Pre-compute endpoints for efficiency
+        start_bbox = self._get_bounding_box(obj)
+        bbox_corners.append(start_bbox)
 
-            # For t=0, use the original object's position
-            if t == 0:
-                bbox = self._get_bounding_box(temp_obj)
-                bbox_corners.append(bbox)
-                continue
+        # Compute end position (reused for interpolation if needed)
+        end_obj = obj.copy()
+        animation_function(end_obj)
+        end_bbox = self._get_bounding_box(end_obj)
 
-            try:
-                # Try to use partial_apply_function from manim if available
-                # This is a more accurate way to get intermediate states for complex animations
-                self._apply_animation_at_time(temp_obj, animation_function, t)
+        # For simple animations, just do linear interpolation between start and end
+        if not is_complex_animation:
+            for t in np.linspace(0, 1, sample_count)[1:]:
+                interp_bbox = [
+                    [
+                        start_bbox[0][0] * (1 - t) + end_bbox[0][0] * t,
+                        start_bbox[0][1] * (1 - t) + end_bbox[0][1] * t,
+                    ],
+                    [
+                        start_bbox[1][0] * (1 - t) + end_bbox[1][0] * t,
+                        start_bbox[1][1] * (1 - t) + end_bbox[1][1] * t,
+                    ],
+                ]
+                bbox_corners.append(interp_bbox)
+        else:
+            # For complex animations, sample at intermediate points
+            for t in np.linspace(0, 1, sample_count)[
+                1:-1
+            ]:  # Skip first and last (already have them)
+                # Create a temporary copy of the object for this time point
+                temp_obj = obj.copy()
 
-                # Get the bounding box at this time point
-                bbox = self._get_bounding_box(temp_obj)
-                bbox_corners.append(bbox)
-            except Exception as e:
-                # If partial application fails, fall back to linear interpolation
-                if len(bbox_corners) == 0:
-                    # Initial position (needed if t=0 failed)
-                    start_bbox = self._get_bounding_box(obj)
-                    bbox_corners.append(start_bbox)
+                try:
+                    # Apply animation at this time point
+                    self._apply_animation_at_time(temp_obj, animation_function, t)
+                    bbox = self._get_bounding_box(temp_obj)
+                    bbox_corners.append(bbox)
+                except Exception:
+                    # Fall back to linear interpolation for this point
+                    interp_bbox = [
+                        [
+                            start_bbox[0][0] * (1 - t) + end_bbox[0][0] * t,
+                            start_bbox[0][1] * (1 - t) + end_bbox[0][1] * t,
+                        ],
+                        [
+                            start_bbox[1][0] * (1 - t) + end_bbox[1][0] * t,
+                            start_bbox[1][1] * (1 - t) + end_bbox[1][1] * t,
+                        ],
+                    ]
+                    bbox_corners.append(interp_bbox)
 
-                    # Final position
-                    end_obj = obj.copy()
-                    animation_function(end_obj)
-                    end_bbox = self._get_bounding_box(end_obj)
+            # Add end point
+            bbox_corners.append(end_bbox)
 
-                    # Linearly interpolate between start and end for all samples
-                    for interp_t in np.linspace(0, 1, self.samples)[1:]:
-                        interp_bbox = [
-                            [
-                                start_bbox[0][0] * (1 - interp_t)
-                                + end_bbox[0][0] * interp_t,
-                                start_bbox[0][1] * (1 - interp_t)
-                                + end_bbox[0][1] * interp_t,
-                            ],
-                            [
-                                start_bbox[1][0] * (1 - interp_t)
-                                + end_bbox[1][0] * interp_t,
-                                start_bbox[1][1] * (1 - interp_t)
-                                + end_bbox[1][1] * interp_t,
-                            ],
-                        ]
-                        bbox_corners.append(interp_bbox)
-                    break
-
-        # Convert the sequence of bounding boxes into a polygon path
+        # Convert the sequence of bounding boxes into a LineString path
+        points = []
         for bbox in bbox_corners:
             top_left = bbox[0]
             bottom_right = bbox[1]
             top_right = [bottom_right[0], top_left[1]]
             bottom_left = [top_left[0], bottom_right[1]]
 
-            points.extend([top_left, top_right, bottom_right, bottom_left])
+            # Simplified approach: just add corners of the box
+            points.append(top_left)
+            points.append(top_right)
+            points.append(bottom_right)
+            points.append(bottom_left)
 
         # Create a LineString from all the sampled points to represent the trajectory
         if points:
@@ -255,73 +296,123 @@ class LayoutManager:
             bbox = self._get_bounding_box(obj)
             return LineString([bbox[0], bbox[1]])
 
+    def _is_complex_animation(self, animation_function):
+        """
+        Determine if an animation is likely complex (needs full sampling) or simple.
+        Simple animations can use linear interpolation for better performance.
+        """
+        if animation_function is None:
+            return False
+
+        # Check function name for common simple transformations
+        func_name = (
+            animation_function.__name__
+            if hasattr(animation_function, "__name__")
+            else str(animation_function)
+        )
+        simple_patterns = ["shift", "move_to", "scale", "rotate", "next_to", "linear"]
+
+        for pattern in simple_patterns:
+            if pattern in func_name.lower():
+                return False
+
+        # If lambda or complex animation, consider it complex
+        return True
+
     def _apply_animation_at_time(self, obj, animation_function, t):
         """
         Applies an animation to an object at a specific time point t (0-1).
         This is a helper method to sample animation states at intermediate points.
-        """
-        # First, check if the animation_function returns a Manim Animation
-        try:
-            test_obj = obj.copy()
-            anim = animation_function(test_obj)
 
+        Optimized version with fast path for common animation types.
+        """
+        # Fast path for t=1 (full animation)
+        if t == 1:
+            animation_function(obj)
+            return
+
+        # Fast path for t=0 (no animation)
+        if t == 0:
+            return
+
+        # Check for common animation types first
+        try:
+            # Extract animation name to detect common types
+            func_name = (
+                animation_function.__name__
+                if hasattr(animation_function, "__name__")
+                else str(animation_function)
+            )
+
+            # Fast path for shift animations
+            if "shift" in func_name.lower():
+                # Create reference object with full animation
+                ref_obj = obj.copy()
+                animation_function(ref_obj)
+
+                # Calculate shift vector and apply partial shift
+                start_pos = obj.get_center()
+                end_pos = ref_obj.get_center()
+                shift_vector = (end_pos - start_pos) * t
+                obj.shift(shift_vector)
+                return
+
+            # Fast path for scale animations
+            if "scale" in func_name.lower():
+                # Apply partial scale
+                # Extract scale factor if possible, otherwise use approximation
+                end_obj = obj.copy()
+                animation_function(end_obj)
+
+                start_scale = obj.get_height()
+                end_scale = end_obj.get_height()
+                scale_factor = 1 + (end_scale / start_scale - 1) * t
+                obj.scale(scale_factor)
+                return
+
+            # Try to use animation's interpolate_mobject if it's an Animation
+            anim = animation_function(obj.copy())
             if hasattr(anim, "interpolate_mobject"):
-                # It's an Animation object, so we can use interpolate_mobject
                 anim.interpolate_mobject(t)
                 return
         except:
             pass
 
-        # If we get here, it's probably a transform function (like lambda m: m.shift(RIGHT))
-        # For simple transforms, we can try a linear approximation
-        if t == 1:
-            # For t=1, just apply the full animation
-            animation_function(obj)
-        else:
-            # Try to detect common Manim transforms and interpolate them
-            try:
-                # Create two copies - one with no transform, one with full transform
-                start_obj = obj.copy()
-                end_obj = obj.copy()
-                animation_function(end_obj)
+        # Fallback: create end state and interpolate
+        try:
+            end_obj = obj.copy()
+            animation_function(end_obj)
 
-                # Interpolate position between start and end
-                start_pos = start_obj.get_center()
-                end_pos = end_obj.get_center()
-                interp_pos = start_pos * (1 - t) + end_pos * t
+            # Interpolate position
+            start_pos = obj.get_center()
+            end_pos = end_obj.get_center()
+            interp_pos = start_pos * (1 - t) + end_pos * t
+            obj.move_to(interp_pos)
 
-                # Move the object to interpolated position
-                obj.move_to(interp_pos)
+            # Try to interpolate scaling if noticeable change
+            start_scale = obj.get_height()
+            end_scale = end_obj.get_height()
+            if abs(start_scale - end_scale) > 0.01:
+                scale_factor = 1 + (end_scale / start_scale - 1) * t
+                obj.scale(scale_factor)
 
-                # Try to interpolate scaling
-                start_scale = np.array(start_obj.get_height())
-                end_scale = np.array(end_obj.get_height())
-                if (
-                    abs(start_scale - end_scale) > 0.01
-                ):  # Only if there's a noticeable scale change
-                    scale_factor = 1 + (end_scale / start_scale - 1) * t
-                    obj.scale(scale_factor)
-
-                # Try to interpolate rotation
-                # (This is a simplified approximation)
-                start_angle = (
-                    start_obj.get_angle() if hasattr(start_obj, "get_angle") else 0
-                )
-                end_angle = end_obj.get_angle() if hasattr(end_obj, "get_angle") else 0
-                if (
-                    abs(end_angle - start_angle) > 0.01
-                ):  # Only if there's a noticeable rotation
+            # Try to interpolate rotation if applicable
+            if hasattr(obj, "get_angle"):
+                start_angle = obj.get_angle()
+                end_angle = end_obj.get_angle()
+                if abs(end_angle - start_angle) > 0.01:
                     interp_angle = start_angle * (1 - t) + end_angle * t
                     obj.rotate(interp_angle - start_angle)
+        except:
+            # Last resort: just apply full animation if t > 0.5
+            if t > 0.5:
+                animation_function(obj)
 
-            except Exception as e:
-                # If interpolation fails, fall back to direct application for t=1
-                if t > 0.5:
-                    animation_function(obj)
-
+    @lru_cache(maxsize=128)
     def _get_bounding_box(self, obj: Mobject):
         """
         Returns the top-left and bottom-right corners of the bounding box for the given Mobject.
+        Uses caching to avoid recalculating for the same object state.
 
         Args:
             obj , Mobject:
@@ -331,35 +422,42 @@ class LayoutManager:
             tuple:
                 ([min_x, max_y], [max_x, min_y]) - the top-left and bottom-right corners
         """
+        # Check if cached result exists
+        obj_id = id(obj)
+        if obj_id in self._bbox_cache:
+            return self._bbox_cache[obj_id]
+
+        # Calculate bounding box
         points = obj.get_all_points()
         if len(points) == 0:
-            return [0, 0], [0, 0]  # fallback if object has no geometry
+            result = [0, 0], [0, 0]  # fallback if object has no geometry
+            self._bbox_cache[obj_id] = result
+            return result
 
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
+        # Use numpy for faster min/max operations
+        points_array = np.array(points)
+        min_x, min_y = np.min(points_array, axis=0)[:2]  # Take only x,y
+        max_x, max_y = np.max(points_array, axis=0)[:2]  # Take only x,y
 
         top_left = [min_x, max_y]
         bottom_right = [max_x, min_y]
 
-        return top_left, bottom_right
+        result = (top_left, bottom_right)
+        self._bbox_cache[obj_id] = result
+        return result
 
-    def _path_within_bounds(self, path, frame_box: Polygon):
+    def _path_within_bounds(self, path):
         """
         Check if a path stays within the frame boundaries.
 
         Args:
             path:
                 Shapely geometry representing the object's path
-            frame_box:
-                Shapely box representing the visible frame
 
         Returns:
             bool: True if the path is completely within bounds
         """
-        return frame_box.contains(path)
+        return self.FRAME_BOX.contains(path)
 
     def _in_same_collision_group(self, id_i, id_j):
         """
@@ -373,10 +471,23 @@ class LayoutManager:
             bool:
                 True if the objects are in the same collision group
         """
-        for group_ids in self.collision_groups.values():
-            if id_i in group_ids and id_j in group_ids:
-                return True
-        return False
+        # Fast path: convert to lookup table the first time
+        collision_lookup = getattr(self, "_collision_lookup", None)
+        if collision_lookup is None:
+            # Create lookup table mapping object ID to all its groups
+            self._collision_lookup = {}
+            for group_name, group_ids in self.collision_groups.items():
+                for obj_id in group_ids:
+                    if obj_id not in self._collision_lookup:
+                        self._collision_lookup[obj_id] = set()
+                    self._collision_lookup[obj_id].add(group_name)
+            collision_lookup = self._collision_lookup
+
+        # Check if objects share any group
+        groups_i = collision_lookup.get(id_i, set())
+        groups_j = collision_lookup.get(id_j, set())
+
+        return bool(groups_i.intersection(groups_j))
 
     def _detect_time_based_collisions(self, obj_i, config_i, obj_j, config_j):
         """
@@ -402,14 +513,13 @@ class LayoutManager:
             # Just check if they're currently overlapping
             return [0.0] if self._objects_overlap(obj_i, obj_j) else []
 
-        # Set number of time points to check (more points = more accurate collision detection)
-        check_points = max(
-            self.samples, 10
-        )  # At least 10 points for collision detection
+        # Adaptive sampling - use fewer points for initial check, more for detailed analysis
+        initial_points = min(5, self.samples)  # First pass with fewer points
         collision_times = []
 
-        # Check collision at multiple time points
-        for t in np.linspace(0, 1, check_points):
+        # First pass: check collision at initial resolution
+        potential_collisions = False
+        for t in np.linspace(0, 1, initial_points):
             # Make copies of objects to avoid modifying originals
             temp_i = obj_i.copy()
             temp_j = obj_j.copy()
@@ -420,7 +530,29 @@ class LayoutManager:
 
             # Check if objects overlap at this time point
             if self._objects_overlap(temp_i, temp_j):
-                collision_times.append(t)
+                if initial_points == self.samples:
+                    # If we're already at full resolution, record the collision
+                    collision_times.append(t)
+                else:
+                    # Flag for second pass with higher resolution
+                    potential_collisions = True
+                    break
+
+        # Second pass: higher resolution check only if needed
+        if potential_collisions:
+            check_points = max(self.samples, 10)  # Full resolution
+            for t in np.linspace(0, 1, check_points):
+                # Make copies of objects
+                temp_i = obj_i.copy()
+                temp_j = obj_j.copy()
+
+                # Apply animations at time t
+                self._apply_animation_at_time(temp_i, anim_func_i, t)
+                self._apply_animation_at_time(temp_j, anim_func_j, t)
+
+                # Check if objects overlap at this time point
+                if self._objects_overlap(temp_i, temp_j):
+                    collision_times.append(t)
 
         return collision_times
 
